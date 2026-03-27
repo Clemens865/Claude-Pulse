@@ -21,12 +21,18 @@ INPUT="$(cat)" || true
 [ -z "$INPUT" ] && exit 0
 
 # --- Parse common fields ---
-HOOK_TYPE="$(echo "$INPUT" | jq -r '.hook_type // empty' 2>/dev/null)" || true
+# Claude Code provides hook_event_name (not hook_type) and session_id in stdin JSON
+HOOK_TYPE="$(echo "$INPUT" | jq -r '.hook_event_name // .hook_type // empty' 2>/dev/null)" || true
 SESSION_ID="$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)" || true
 CWD="$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null)" || true
 TOOL_NAME="$(echo "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null)" || true
 
 [ -z "$HOOK_TYPE" ] && exit 0
+
+# Fallback session ID if not provided
+if [ -z "$SESSION_ID" ]; then
+    SESSION_ID="session-$(date -u '+%Y%m%d-%H%M%S')-$$"
+fi
 
 # --- Session dir from Claude session ID ---
 if [ -n "$SESSION_ID" ]; then
@@ -161,6 +167,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     started_at TEXT NOT NULL DEFAULT (datetime('now')),
     ended_at TEXT,
     duration_seconds INTEGER,
+    summary TEXT,
     status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'completed', 'crashed'))
 );
 
@@ -241,8 +248,38 @@ CREATE INDEX IF NOT EXISTS idx_file_activity_path ON file_activity(file_path);
 CREATE INDEX IF NOT EXISTS idx_file_activity_project ON file_activity(project);
 CREATE INDEX IF NOT EXISTS idx_file_activity_date ON file_activity(date);
 
-INSERT OR IGNORE INTO schema_version (version) VALUES (1);
+CREATE TABLE IF NOT EXISTS insights (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT REFERENCES sessions(id),
+    project TEXT NOT NULL,
+    type TEXT NOT NULL CHECK(type IN ('progress','decision','pattern','fix','context','blocked')),
+    content TEXT NOT NULL,
+    reasoning TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_insights_project ON insights(project);
+CREATE INDEX IF NOT EXISTS idx_insights_type ON insights(type);
+CREATE INDEX IF NOT EXISTS idx_insights_session ON insights(session_id);
+CREATE INDEX IF NOT EXISTS idx_insights_created ON insights(created_at);
+
+INSERT OR IGNORE INTO schema_version (version) VALUES (2);
 SCHEMA
+    else
+        # Migrate existing DB: add insights table if missing
+        sqlite3 "$DB_PATH" "CREATE TABLE IF NOT EXISTS insights (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT REFERENCES sessions(id),
+            project TEXT NOT NULL,
+            type TEXT NOT NULL CHECK(type IN ('progress','decision','pattern','fix','context','blocked')),
+            content TEXT NOT NULL,
+            reasoning TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );" 2>/dev/null || true
+        sqlite3 "$DB_PATH" "CREATE INDEX IF NOT EXISTS idx_insights_project ON insights(project);" 2>/dev/null || true
+        sqlite3 "$DB_PATH" "CREATE INDEX IF NOT EXISTS idx_insights_type ON insights(type);" 2>/dev/null || true
+        sqlite3 "$DB_PATH" "CREATE INDEX IF NOT EXISTS idx_insights_session ON insights(session_id);" 2>/dev/null || true
+        sqlite3 "$DB_PATH" "CREATE INDEX IF NOT EXISTS idx_insights_created ON insights(created_at);" 2>/dev/null || true
     fi
     # Ensure WAL mode on existing DB
     sqlite3 "$DB_PATH" "PRAGMA journal_mode=WAL;" >/dev/null 2>&1 || true
@@ -272,21 +309,33 @@ handle_session_start() {
     # Create session tmp dir
     mkdir -p "$SESSION_DIR" 2>/dev/null || true
 
-    # Output context injection (query recent activity)
+    # Output context injection — share cross-session context
     local ctx=""
-    local last_session
-    last_session="$(sqlite3 "$DB_PATH" "SELECT s.duration_seconds, (SELECT COUNT(*) FROM tool_events WHERE session_id=s.id) as events FROM sessions s WHERE s.project='$esc_project' AND s.status='completed' ORDER BY s.ended_at DESC LIMIT 1;" 2>/dev/null)" || true
+    local esc_sid
+    esc_sid="$(sql_escape "$SESSION_ID")"
 
-    if [ -n "$last_session" ]; then
-        local dur events
-        dur="$(echo "$last_session" | cut -d'|' -f1)"
-        events="$(echo "$last_session" | cut -d'|' -f2)"
-        if [ -n "$dur" ] && [ "$dur" != "" ]; then
-            local mins=$(( dur / 60 ))
-            ctx="Last session in $PROJECT: ${mins}min, ${events} tool calls."
+    # 1. Last session's Claude-written summary (the most valuable context)
+    local last_summary
+    last_summary="$(sqlite3 "$DB_PATH" "SELECT summary FROM sessions WHERE project='$esc_project' AND status='completed' AND summary IS NOT NULL AND summary != '' ORDER BY ended_at DESC LIMIT 1;" 2>/dev/null)" || true
+
+    if [ -n "$last_summary" ]; then
+        ctx="Last session: ${last_summary}"
+    else
+        # Fallback to basic stats if no summary exists yet
+        local last_session
+        last_session="$(sqlite3 "$DB_PATH" "SELECT s.duration_seconds, (SELECT COUNT(*) FROM tool_events WHERE session_id=s.id) as events FROM sessions s WHERE s.project='$esc_project' AND s.status='completed' ORDER BY s.ended_at DESC LIMIT 1;" 2>/dev/null)" || true
+        if [ -n "$last_session" ]; then
+            local dur events
+            dur="$(echo "$last_session" | cut -d'|' -f1)"
+            events="$(echo "$last_session" | cut -d'|' -f2)"
+            if [ -n "$dur" ] && [ "$dur" != "" ]; then
+                local mins=$(( dur / 60 ))
+                ctx="Last session in $PROJECT: ${mins}min, ${events} tool calls."
+            fi
         fi
     fi
 
+    # 2. Today's stats
     local today_stats
     today_stats="$(sqlite3 "$DB_PATH" "SELECT COUNT(DISTINCT s.id), COUNT(e.id) FROM sessions s LEFT JOIN tool_events e ON e.session_id=s.id WHERE date(s.started_at)='$TODAY';" 2>/dev/null)" || true
 
@@ -299,8 +348,56 @@ handle_session_start() {
         fi
     fi
 
+    # 3. Recently edited files (last session) — helps resume context
+    local recent_files
+    recent_files="$(sqlite3 "$DB_PATH" "
+        SELECT DISTINCT REPLACE(file_path, '$(sql_escape "$CWD")/', '') FROM tool_events
+        WHERE session_id=(SELECT id FROM sessions WHERE project='$esc_project' AND status='completed' ORDER BY ended_at DESC LIMIT 1)
+        AND tool_name IN ('Edit','Write') AND file_path IS NOT NULL AND file_path != ''
+        ORDER BY timestamp DESC LIMIT 5;
+    " 2>/dev/null)" || true
+
+    if [ -n "$recent_files" ]; then
+        local files_list
+        files_list="$(echo "$recent_files" | tr '\n' ', ' | sed 's/,$//')"
+        ctx="${ctx:+$ctx }Last edited: ${files_list}."
+    fi
+
+    # 4. Recent bash failures — helps avoid repeating mistakes
+    local recent_failures
+    recent_failures="$(sqlite3 "$DB_PATH" "
+        SELECT command FROM tool_events
+        WHERE session_id=(SELECT id FROM sessions WHERE project='$esc_project' AND status='completed' ORDER BY ended_at DESC LIMIT 1)
+        AND tool_name='Bash' AND command_failed=1
+        ORDER BY timestamp DESC LIMIT 3;
+    " 2>/dev/null)" || true
+
+    if [ -n "$recent_failures" ]; then
+        local fail_count
+        fail_count="$(echo "$recent_failures" | wc -l | tr -d ' ')"
+        ctx="${ctx:+$ctx }Last session had ${fail_count} failed command(s)."
+    fi
+
+    # 5. Project lifetime stats
+    local project_stats
+    project_stats="$(sqlite3 "$DB_PATH" "
+        SELECT COUNT(*), COALESCE(SUM(net_lines),0), COALESCE(SUM(tool_calls),0)
+        FROM daily_summaries WHERE project='$esc_project';
+    " 2>/dev/null)" || true
+
+    if [ -n "$project_stats" ]; then
+        local total_days net_lines total_tools
+        total_days="$(echo "$project_stats" | cut -d'|' -f1)"
+        net_lines="$(echo "$project_stats" | cut -d'|' -f2)"
+        total_tools="$(echo "$project_stats" | cut -d'|' -f3)"
+        if [ "$total_days" -gt 0 ] 2>/dev/null; then
+            ctx="${ctx:+$ctx }Project lifetime: ${total_days} active day(s), ${net_lines} net lines, ${total_tools} tool calls."
+        fi
+    fi
+
     if [ -n "$ctx" ]; then
-        printf '{"hookSpecificOutput":{"additionalContext":"%s"}}' "$(echo "$ctx" | sed 's/"/\\"/g')"
+        local instruction="When this session ends, your last message will be stored as the session summary for this project. Keep your final message concise and descriptive of what was accomplished."
+        printf '{"hookSpecificOutput":{"additionalContext":"[Claude Pulse] %s %s"}}' "$(echo "$ctx" | sed 's/"/\\"/g')" "$(echo "$instruction" | sed 's/"/\\"/g')"
     fi
 }
 
@@ -370,9 +467,9 @@ handle_tool_event() {
         Bash)
             command="$(echo "$tool_input" | jq -r '.command // empty' 2>/dev/null)" || true
             framework="$(detect_frameworks "$command")"
-            # Check if command failed from tool_output
+            # Check if command failed — Claude Code uses tool_response (not tool_output)
             local exit_code
-            exit_code="$(echo "$INPUT" | jq -r '.tool_output.exit_code // 0' 2>/dev/null)" || exit_code=0
+            exit_code="$(echo "$INPUT" | jq -r '.tool_response.exit_code // .tool_output.exit_code // 0' 2>/dev/null)" || exit_code=0
             if [ "$exit_code" != "0" ] && [ "$exit_code" != "null" ] && [ -n "$exit_code" ]; then
                 command_failed=1
             fi
@@ -431,7 +528,7 @@ handle_tool_event() {
         '$(sql_escape "$metadata")'
     );" 2>/dev/null || true
 
-    # File hotspot detection for Edit/Write
+    # Hotspot detection only — no per-tool summaries (Claude writes its own summary at session end)
     if [ "$TOOL_NAME" = "Edit" ] || [ "$TOOL_NAME" = "Write" ]; then
         if [ -n "$file_path" ]; then
             local edit_count
@@ -450,6 +547,86 @@ handle_session_stop() {
     if [ "$HOOK_TYPE" = "StopFailure" ]; then
         status="crashed"
     fi
+
+    local esc_sid
+    esc_sid="$(sql_escape "$SESSION_ID")"
+    local esc_project
+    esc_project="$(sql_escape "$PROJECT")"
+
+    # --- Smart gating: skip summary for trivial/read-only sessions ---
+    local summary_guard="/tmp/claude-pulse-summary-${SESSION_ID}"
+    local last_msg
+    last_msg="$(echo "$INPUT" | jq -r '.last_assistant_message // empty' 2>/dev/null)" || true
+
+    if [ ! -f "$summary_guard" ] && [ "$status" != "crashed" ]; then
+        # Check if session had any write activity (Edit/Write/Bash with changes)
+        local write_events=0
+        write_events="$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM tool_events WHERE session_id='$esc_sid' AND tool_name IN ('Edit','Write','Bash','Agent');" 2>/dev/null)" || write_events=0
+
+        if [ "$write_events" -le 2 ] 2>/dev/null; then
+            # Trivial session — skip summary, just close
+            # Still record a minimal auto-summary
+            local event_count=0
+            event_count="$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM tool_events WHERE session_id='$esc_sid';" 2>/dev/null)" || event_count=0
+            local auto_summary="[auto] Read-only session: ${event_count} events, no significant changes."
+            sqlite3 "$DB_PATH" "UPDATE sessions SET summary='$(sql_escape "$auto_summary")' WHERE id='$esc_sid';" 2>/dev/null || true
+        else
+            # Meaningful session — block once, ask for structured summary
+            touch "$summary_guard" 2>/dev/null || true
+
+            local prompt="Session ending for ${PROJECT}. Respond with ONLY these lines (skip empty categories):\nPROGRESS: <what was accomplished, 1 line>\nDECISION: <key choice and why> (repeat if multiple)\nBLOCKED: <what's stuck or left to do>"
+            printf '{"decision":"block","reason":"%s"}' "$(echo "$prompt" | sed 's/"/\\"/g')"
+            exit 0
+        fi
+    fi
+
+    # Second Stop (after summary): parse structured response into insights
+    if [ -f "$summary_guard" ] && [ -n "$last_msg" ] && [ ${#last_msg} -gt 5 ]; then
+        # Store full summary on session (backward compat)
+        local summary_text
+        summary_text="$(echo "$last_msg" | head -c 500)"
+        sqlite3 "$DB_PATH" "UPDATE sessions SET summary='$(sql_escape "$summary_text")' WHERE id='$esc_sid';" 2>/dev/null || true
+
+        # Parse structured lines into insights table
+        local line type content reasoning
+        echo "$last_msg" | while IFS= read -r line; do
+            type="" content="" reasoning=""
+            case "$line" in
+                PROGRESS:*)
+                    type="progress"
+                    content="${line#PROGRESS: }"
+                    content="${content#PROGRESS:}"
+                    ;;
+                DECISION:*)
+                    type="decision"
+                    content="${line#DECISION: }"
+                    content="${content#DECISION:}"
+                    ;;
+                BLOCKED:*)
+                    type="blocked"
+                    content="${line#BLOCKED: }"
+                    content="${content#BLOCKED:}"
+                    ;;
+                PATTERN:*)
+                    type="pattern"
+                    content="${line#PATTERN: }"
+                    content="${content#PATTERN:}"
+                    ;;
+                FIX:*)
+                    type="fix"
+                    content="${line#FIX: }"
+                    content="${content#FIX:}"
+                    ;;
+            esac
+            if [ -n "$type" ] && [ -n "$content" ]; then
+                sqlite3 "$DB_PATH" "INSERT INTO insights (session_id, project, type, content, created_at)
+                    VALUES ('$esc_sid', '$esc_project', '$type', '$(sql_escape "$content")', '$NOW');" 2>/dev/null || true
+            fi
+        done
+    fi
+
+    # Clean up guard file
+    rm -f "$summary_guard" 2>/dev/null || true
 
     # Calculate duration
     local start_time duration=0
@@ -485,6 +662,49 @@ handle_session_stop() {
     local esc_sid
     esc_sid="$(sql_escape "$SESSION_ID")"
 
+    # Build JSON aggregation fields from this session's tool_events
+    local skills_json frameworks_json languages_json tool_counts_json
+
+    # Aggregate skill usage: {"commit": 3, "fix-bug": 1}
+    skills_json="$(sqlite3 "$DB_PATH" "
+        SELECT '{' || GROUP_CONCAT('\"' || REPLACE(skill_name, '\"', '\\\"') || '\":' || cnt) || '}'
+        FROM (SELECT skill_name, COUNT(*) as cnt FROM tool_events
+              WHERE session_id='$esc_sid' AND skill_name IS NOT NULL AND skill_name != ''
+              GROUP BY skill_name ORDER BY cnt DESC);
+    " 2>/dev/null)" || skills_json="{}"
+    [ -z "$skills_json" ] || [ "$skills_json" = "{null}" ] && skills_json="{}"
+
+    # Aggregate framework detection: {"npm/node": 12, "git": 5}
+    frameworks_json="$(sqlite3 "$DB_PATH" "
+        SELECT '{' || GROUP_CONCAT('\"' || REPLACE(fw, '\"', '\\\"') || '\":' || cnt) || '}'
+        FROM (
+            SELECT TRIM(value) as fw, COUNT(*) as cnt
+            FROM tool_events, json_each('[\"' || REPLACE(REPLACE(detected_framework, ',', '\",\"'), ' ', '') || '\"]')
+            WHERE session_id='$esc_sid' AND detected_framework IS NOT NULL AND detected_framework != ''
+            AND TRIM(value) != ''
+            GROUP BY fw ORDER BY cnt DESC
+        );
+    " 2>/dev/null)" || frameworks_json="{}"
+    [ -z "$frameworks_json" ] || [ "$frameworks_json" = "{null}" ] && frameworks_json="{}"
+
+    # Aggregate languages: {"TypeScript": 20, "CSS": 5}
+    languages_json="$(sqlite3 "$DB_PATH" "
+        SELECT '{' || GROUP_CONCAT('\"' || REPLACE(language, '\"', '\\\"') || '\":' || cnt) || '}'
+        FROM (SELECT language, COUNT(*) as cnt FROM tool_events
+              WHERE session_id='$esc_sid' AND language IS NOT NULL AND language != '' AND language != 'Unknown'
+              GROUP BY language ORDER BY cnt DESC);
+    " 2>/dev/null)" || languages_json="{}"
+    [ -z "$languages_json" ] || [ "$languages_json" = "{null}" ] && languages_json="{}"
+
+    # Aggregate tool counts: {"Edit": 30, "Write": 5, "Bash": 8}
+    tool_counts_json="$(sqlite3 "$DB_PATH" "
+        SELECT '{' || GROUP_CONCAT('\"' || tool_name || '\":' || cnt) || '}'
+        FROM (SELECT tool_name, COUNT(*) as cnt FROM tool_events
+              WHERE session_id='$esc_sid'
+              GROUP BY tool_name ORDER BY cnt DESC);
+    " 2>/dev/null)" || tool_counts_json="{}"
+    [ -z "$tool_counts_json" ] || [ "$tool_counts_json" = "{null}" ] && tool_counts_json="{}"
+
     sqlite3 "$DB_PATH" "
     INSERT INTO daily_summaries (date, project, session_count, total_duration_seconds,
         lines_added, lines_removed, net_lines, files_created, files_edited, files_read,
@@ -506,10 +726,10 @@ handle_session_stop() {
         (SELECT COUNT(*) FROM tool_events WHERE session_id='$esc_sid' AND tool_name='Bash' AND command_failed=1),
         (SELECT COUNT(*) FROM tool_events WHERE session_id='$esc_sid' AND tool_name IN ('Glob','Grep')),
         (SELECT COUNT(*) FROM tool_events WHERE session_id='$esc_sid' AND tool_name='Agent'),
-        '{}',
-        '{}',
-        '{}',
-        '{}'
+        '$(sql_escape "$skills_json")',
+        '$(sql_escape "$frameworks_json")',
+        '$(sql_escape "$languages_json")',
+        '$(sql_escape "$tool_counts_json")'
     FROM tool_events WHERE session_id='$esc_sid'
     ON CONFLICT(date, project) DO UPDATE SET
         session_count = excluded.session_count,
@@ -524,7 +744,11 @@ handle_session_stop() {
         bash_commands = daily_summaries.bash_commands + excluded.bash_commands,
         bash_failures = daily_summaries.bash_failures + excluded.bash_failures,
         searches = daily_summaries.searches + excluded.searches,
-        agents_spawned = daily_summaries.agents_spawned + excluded.agents_spawned;
+        agents_spawned = daily_summaries.agents_spawned + excluded.agents_spawned,
+        skills_used = excluded.skills_used,
+        frameworks_detected = excluded.frameworks_detected,
+        languages = excluded.languages,
+        tool_counts = excluded.tool_counts;
     " 2>/dev/null || true
 
     # Clean up tmp dir

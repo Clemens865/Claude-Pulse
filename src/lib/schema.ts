@@ -5,7 +5,7 @@ import type Database from "better-sqlite3";
  * All tables use TEXT for timestamps (ISO 8601) and JSON strings for structured metadata.
  */
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 const CREATE_TABLES = `
 -- Session lifecycle tracking
@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     started_at TEXT NOT NULL DEFAULT (datetime('now')),
     ended_at TEXT,
     duration_seconds INTEGER,
+    summary TEXT,
     status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'completed', 'crashed'))
 );
 
@@ -64,6 +65,17 @@ CREATE TABLE IF NOT EXISTS daily_summaries (
     UNIQUE(date, project)
 );
 
+-- Structured insights (brain layer)
+CREATE TABLE IF NOT EXISTS insights (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT REFERENCES sessions(id),
+    project TEXT NOT NULL,
+    type TEXT NOT NULL CHECK(type IN ('progress','decision','pattern','fix','context','blocked')),
+    content TEXT NOT NULL,
+    reasoning TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- Per-file daily activity tracking
 CREATE TABLE IF NOT EXISTS file_activity (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,6 +108,12 @@ CREATE INDEX IF NOT EXISTS idx_events_session_tool ON tool_events(session_id, to
 -- Daily summary indexes
 CREATE INDEX IF NOT EXISTS idx_summaries_date ON daily_summaries(date);
 CREATE INDEX IF NOT EXISTS idx_summaries_project ON daily_summaries(project);
+
+-- Insight indexes
+CREATE INDEX IF NOT EXISTS idx_insights_project ON insights(project);
+CREATE INDEX IF NOT EXISTS idx_insights_type ON insights(type);
+CREATE INDEX IF NOT EXISTS idx_insights_session ON insights(session_id);
+CREATE INDEX IF NOT EXISTS idx_insights_created ON insights(created_at);
 
 -- File activity indexes
 CREATE INDEX IF NOT EXISTS idx_file_activity_path ON file_activity(file_path);

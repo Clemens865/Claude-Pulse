@@ -8,6 +8,7 @@ export interface Session {
   started_at: string;
   ended_at: string | null;
   duration_seconds: number | null;
+  summary: string | null;
   status: "active" | "completed" | "crashed";
 }
 
@@ -52,6 +53,16 @@ export interface DailySummary {
   frameworks_detected: string; // JSON: { "framework": count }
   languages: string; // JSON: { "language": count }
   tool_counts: string; // JSON: { "tool_name": count }
+}
+
+export interface Insight {
+  id: number;
+  session_id: string | null;
+  project: string;
+  type: "progress" | "decision" | "pattern" | "fix" | "context" | "blocked";
+  content: string;
+  reasoning: string | null;
+  created_at: string;
 }
 
 export interface FileActivity {

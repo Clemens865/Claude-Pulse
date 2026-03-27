@@ -20,8 +20,9 @@
         "tasks": [
           "Cross-project daily summary (sessions, events, top projects)"
         ],
-        "status": "active",
-        "started": "2026-03-27T13:30:00.000Z"
+        "status": "done",
+        "started": "2026-03-27T13:30:00.000Z",
+        "completed": "2026-03-27T14:00:00.000Z"
       },
       {
         "id": "sprint-3",
@@ -29,13 +30,14 @@
         "tasks": [
           "Plan status from lazy-fetch/Ralph Loop if present"
         ],
-        "status": "pending"
+        "status": "active",
+        "started": "2026-03-27T14:00:00.000Z"
       }
     ],
     "created": "2026-03-27T12:18:53.810Z",
     "updated": "2026-03-27T12:18:53.810Z"
   },
-  "currentSprint": 1,
+  "currentSprint": 2,
   "status": "running",
   "iterations": 0,
   "maxIterationsPerSprint": 3,

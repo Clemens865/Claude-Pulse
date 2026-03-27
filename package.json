@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "Local-first activity tracker for Claude Code",
   "private": true,
+  "bin": {
+    "claude-pulse": "./bin/claude-pulse.mjs"
+  },
   "scripts": {
     "dev": "next dev --port 3141",
     "build": "next build",

@@ -10,6 +10,8 @@ export interface Session {
   duration_seconds: number | null;
   summary: string | null;
   status: "active" | "completed" | "crashed";
+  user: string | null;
+  hostname: string | null;
 }
 
 export interface ToolEvent {

@@ -5,7 +5,7 @@ import type Database from "better-sqlite3";
  * All tables use TEXT for timestamps (ISO 8601) and JSON strings for structured metadata.
  */
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 const CREATE_TABLES = `
 -- Session lifecycle tracking
@@ -16,7 +16,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     ended_at TEXT,
     duration_seconds INTEGER,
     summary TEXT,
-    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'completed', 'crashed'))
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'completed', 'crashed')),
+    user TEXT,
+    hostname TEXT
 );
 
 -- Granular tool events (append-only)
@@ -37,7 +39,8 @@ CREATE TABLE IF NOT EXISTS tool_events (
     agent_description TEXT,
     skill_name TEXT,
     skill_args TEXT,
-    metadata TEXT DEFAULT '{}'
+    metadata TEXT DEFAULT '{}',
+    diff_content TEXT
 );
 
 -- Pre-computed daily summaries (survive event retention purge)

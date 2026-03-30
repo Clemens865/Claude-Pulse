@@ -16,6 +16,10 @@ DB_DIR="$HOME/.claude-pulse"
 DB_PATH="$DB_DIR/tracker.db"
 SESSION_DIR="/tmp/claude-pulse-$$"
 
+# --- User identity (for audit trail) ---
+PULSE_USER="$(whoami 2>/dev/null)" || PULSE_USER="unknown"
+PULSE_HOSTNAME="$(hostname -s 2>/dev/null)" || PULSE_HOSTNAME="unknown"
+
 # --- Read stdin (JSON payload from Claude Code) ---
 INPUT="$(cat)" || true
 [ -z "$INPUT" ] && exit 0
@@ -168,7 +172,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     ended_at TEXT,
     duration_seconds INTEGER,
     summary TEXT,
-    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'completed', 'crashed'))
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'completed', 'crashed')),
+    user TEXT,
+    hostname TEXT
 );
 
 CREATE TABLE IF NOT EXISTS tool_events (
@@ -188,7 +194,8 @@ CREATE TABLE IF NOT EXISTS tool_events (
     agent_description TEXT,
     skill_name TEXT,
     skill_args TEXT,
-    metadata TEXT DEFAULT '{}'
+    metadata TEXT DEFAULT '{}',
+    diff_content TEXT
 );
 
 CREATE TABLE IF NOT EXISTS daily_summaries (
@@ -263,7 +270,7 @@ CREATE INDEX IF NOT EXISTS idx_insights_type ON insights(type);
 CREATE INDEX IF NOT EXISTS idx_insights_session ON insights(session_id);
 CREATE INDEX IF NOT EXISTS idx_insights_created ON insights(created_at);
 
-INSERT OR IGNORE INTO schema_version (version) VALUES (2);
+INSERT OR IGNORE INTO schema_version (version) VALUES (3);
 SCHEMA
     else
         # Migrate existing DB: add insights table if missing
@@ -280,6 +287,10 @@ SCHEMA
         sqlite3 "$DB_PATH" "CREATE INDEX IF NOT EXISTS idx_insights_type ON insights(type);" 2>/dev/null || true
         sqlite3 "$DB_PATH" "CREATE INDEX IF NOT EXISTS idx_insights_session ON insights(session_id);" 2>/dev/null || true
         sqlite3 "$DB_PATH" "CREATE INDEX IF NOT EXISTS idx_insights_created ON insights(created_at);" 2>/dev/null || true
+        # v3 migration: audit columns
+        sqlite3 "$DB_PATH" "ALTER TABLE sessions ADD COLUMN user TEXT;" 2>/dev/null || true
+        sqlite3 "$DB_PATH" "ALTER TABLE sessions ADD COLUMN hostname TEXT;" 2>/dev/null || true
+        sqlite3 "$DB_PATH" "ALTER TABLE tool_events ADD COLUMN diff_content TEXT;" 2>/dev/null || true
     fi
     # Ensure WAL mode on existing DB
     sqlite3 "$DB_PATH" "PRAGMA journal_mode=WAL;" >/dev/null 2>&1 || true
@@ -304,7 +315,7 @@ handle_session_start() {
     # Create session row
     local esc_project
     esc_project="$(sql_escape "$PROJECT")"
-    sqlite3 "$DB_PATH" "INSERT OR IGNORE INTO sessions (id, project, started_at, status) VALUES ('$(sql_escape "$SESSION_ID")', '$esc_project', '$NOW', 'active');" 2>/dev/null || true
+    sqlite3 "$DB_PATH" "INSERT OR IGNORE INTO sessions (id, project, started_at, status, user, hostname) VALUES ('$(sql_escape "$SESSION_ID")', '$esc_project', '$NOW', 'active', '$(sql_escape "$PULSE_USER")', '$(sql_escape "$PULSE_HOSTNAME")');" 2>/dev/null || true
 
     # Create session tmp dir
     mkdir -p "$SESSION_DIR" 2>/dev/null || true
@@ -432,7 +443,7 @@ handle_tool_event() {
     # Ensure session exists (in case session-start was missed)
     local esc_project
     esc_project="$(sql_escape "$PROJECT")"
-    sqlite3 "$DB_PATH" "INSERT OR IGNORE INTO sessions (id, project, started_at, status) VALUES ('$(sql_escape "$SESSION_ID")', '$esc_project', '$NOW', 'active');" 2>/dev/null || true
+    sqlite3 "$DB_PATH" "INSERT OR IGNORE INTO sessions (id, project, started_at, status, user, hostname) VALUES ('$(sql_escape "$SESSION_ID")', '$esc_project', '$NOW', 'active', '$(sql_escape "$PULSE_USER")', '$(sql_escape "$PULSE_HOSTNAME")');" 2>/dev/null || true
 
     # Parse tool-specific fields
     local file_path="" language="" lines_added=0 lines_removed=0
@@ -462,6 +473,12 @@ handle_tool_event() {
             fi
             lines_removed=$old_lines
             lines_added=$new_lines
+
+            # Capture diff for audit trail (truncate at 2KB)
+            local diff_text=""
+            if [ -n "$old_str" ] || [ -n "$new_str" ]; then
+                diff_text="$(printf '--- old\n%s\n+++ new\n%s' "$(echo "$old_str" | head -c 1024)" "$(echo "$new_str" | head -c 1024)")"
+            fi
 
             # Upsert file_activity
             sqlite3 "$DB_PATH" "INSERT INTO file_activity (file_path, project, date, edit_count, lines_added, lines_removed, language)
@@ -528,12 +545,12 @@ handle_tool_event() {
             ;;
     esac
 
-    # Insert tool event
+    # Insert tool event (with optional diff content for audit trail)
     sqlite3 "$DB_PATH" "INSERT INTO tool_events (
         session_id, tool_name, timestamp, file_path, language,
         lines_added, lines_removed, command, detected_framework,
         command_failed, search_pattern, agent_type, agent_description,
-        skill_name, skill_args, metadata
+        skill_name, skill_args, metadata, diff_content
     ) VALUES (
         '$(sql_escape "$SESSION_ID")',
         '$(sql_escape "$TOOL_NAME")',
@@ -550,7 +567,8 @@ handle_tool_event() {
         '$(sql_escape "$agent_desc")',
         '$(sql_escape "$skill_name")',
         '$(sql_escape "$skill_args")',
-        '$(sql_escape "$metadata")'
+        '$(sql_escape "$metadata")',
+        '$(sql_escape "${diff_text:-}")'
     );" 2>/dev/null || true
 
     # Hotspot detection only — no per-tool summaries (Claude writes its own summary at session end)

@@ -394,6 +394,173 @@ function runDoctor() {
   }
 }
 
+// ─── EXPORT ───
+
+function runExport() {
+  const args = process.argv.slice(3);
+  let format = "json";
+  let startDate = null;
+  let endDate = null;
+  let table = "all";
+
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--format" && args[i + 1]) format = args[++i];
+    if (args[i] === "--start" && args[i + 1]) startDate = args[++i];
+    if (args[i] === "--end" && args[i + 1]) endDate = args[++i];
+    if (args[i] === "--table" && args[i + 1]) table = args[++i];
+  }
+
+  if (!existsSync(DB_PATH)) {
+    console.error("  [!!] No database found. Run: claude-pulse init");
+    process.exit(1);
+  }
+
+  let dateFilter = "";
+  if (startDate) dateFilter += ` AND timestamp >= '${startDate}'`;
+  if (endDate) dateFilter += ` AND timestamp <= '${endDate}'`;
+
+  let sessionDateFilter = "";
+  if (startDate) sessionDateFilter += ` AND started_at >= '${startDate}'`;
+  if (endDate) sessionDateFilter += ` AND started_at <= '${endDate}'`;
+
+  const exportData = {};
+
+  if (table === "all" || table === "sessions") {
+    const rows = execSync(
+      `sqlite3 -json "${DB_PATH}" "SELECT * FROM sessions WHERE 1=1${sessionDateFilter} ORDER BY started_at DESC;"`,
+      { encoding: "utf-8" }
+    ).trim();
+    exportData.sessions = rows ? JSON.parse(rows) : [];
+  }
+
+  if (table === "all" || table === "events") {
+    const rows = execSync(
+      `sqlite3 -json "${DB_PATH}" "SELECT * FROM tool_events WHERE 1=1${dateFilter} ORDER BY timestamp DESC;"`,
+      { encoding: "utf-8" }
+    ).trim();
+    exportData.events = rows ? JSON.parse(rows) : [];
+  }
+
+  if (table === "all" || table === "insights") {
+    const rows = execSync(
+      `sqlite3 -json "${DB_PATH}" "SELECT * FROM insights WHERE 1=1${dateFilter.replace(/timestamp/g, 'created_at')} ORDER BY created_at DESC;"`,
+      { encoding: "utf-8" }
+    ).trim();
+    exportData.insights = rows ? JSON.parse(rows) : [];
+  }
+
+  if (format === "json") {
+    exportData.exported_at = new Date().toISOString();
+    exportData.hostname = execSync("hostname -s", { encoding: "utf-8" }).trim();
+    exportData.user = execSync("whoami", { encoding: "utf-8" }).trim();
+    console.log(JSON.stringify(exportData, null, 2));
+  } else if (format === "csv") {
+    // CSV output for the primary table
+    const targetTable = table === "all" ? "events" : table;
+    const rows = exportData[targetTable] || exportData[Object.keys(exportData)[0]] || [];
+    if (rows.length === 0) {
+      console.error("  No data to export.");
+      return;
+    }
+    const headers = Object.keys(rows[0]);
+    console.log(headers.join(","));
+    for (const row of rows) {
+      console.log(headers.map(h => {
+        const val = String(row[h] ?? "").replace(/"/g, '""');
+        return val.includes(",") || val.includes('"') || val.includes("\n") ? `"${val}"` : val;
+      }).join(","));
+    }
+  } else if (format === "ndjson") {
+    // Newline-delimited JSON — ideal for audit log ingestion
+    const allRows = [
+      ...(exportData.sessions || []).map(r => ({ ...r, _table: "session" })),
+      ...(exportData.events || []).map(r => ({ ...r, _table: "event" })),
+      ...(exportData.insights || []).map(r => ({ ...r, _table: "insight" })),
+    ];
+    allRows.sort((a, b) => (a.timestamp || a.started_at || a.created_at || "").localeCompare(b.timestamp || b.started_at || b.created_at || ""));
+    for (const row of allRows) {
+      console.log(JSON.stringify(row));
+    }
+  }
+}
+
+// ─── VERIFY ───
+
+function runVerify() {
+  console.log("\n  Claude Pulse — Integrity Verification\n");
+
+  if (!existsSync(DB_PATH)) {
+    console.error("  [!!] No database found.");
+    process.exit(1);
+  }
+
+  // Check database integrity
+  try {
+    const integrity = execSync(`sqlite3 "${DB_PATH}" "PRAGMA integrity_check;"`, { encoding: "utf-8" }).trim();
+    if (integrity === "ok") {
+      logOk("Database integrity: OK");
+    } else {
+      logWarn(`Database integrity: ${integrity}`);
+    }
+  } catch (e) {
+    logWarn(`Database integrity check failed: ${e.message}`);
+  }
+
+  // Count records by table
+  const tables = ["sessions", "tool_events", "insights", "daily_summaries", "file_activity"];
+  for (const t of tables) {
+    try {
+      const count = execSync(`sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM ${t};"`, { encoding: "utf-8" }).trim();
+      logOk(`${t}: ${count} records`);
+    } catch { /* ignore */ }
+  }
+
+  // Check for sessions with user/hostname
+  try {
+    const withUser = execSync(
+      `sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM sessions WHERE user IS NOT NULL AND user != '';"`,
+      { encoding: "utf-8" }
+    ).trim();
+    const total = execSync(
+      `sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM sessions;"`,
+      { encoding: "utf-8" }
+    ).trim();
+    logOk(`Sessions with user identity: ${withUser}/${total}`);
+  } catch { /* ignore */ }
+
+  // Check for events with diff content
+  try {
+    const withDiff = execSync(
+      `sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM tool_events WHERE diff_content IS NOT NULL AND diff_content != '';"`,
+      { encoding: "utf-8" }
+    ).trim();
+    const totalEdits = execSync(
+      `sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM tool_events WHERE tool_name IN ('Edit','Write');"`,
+      { encoding: "utf-8" }
+    ).trim();
+    logOk(`Edit events with diff captured: ${withDiff}/${totalEdits}`);
+  } catch { /* ignore */ }
+
+  // Check date range coverage
+  try {
+    const range = execSync(
+      `sqlite3 "${DB_PATH}" "SELECT MIN(started_at), MAX(started_at) FROM sessions;"`,
+      { encoding: "utf-8" }
+    ).trim();
+    const [first, last] = range.split("|");
+    if (first && last) {
+      logOk(`Date range: ${first.split("T")[0]} → ${last.split("T")[0]}`);
+    }
+  } catch { /* ignore */ }
+
+  // Database file size
+  const sizeBytes = statSync(DB_PATH).size;
+  const sizeMB = (sizeBytes / 1024 / 1024).toFixed(2);
+  logOk(`Database size: ${sizeMB} MB`);
+
+  console.log();
+}
+
 // ─── ROUTE ───
 
 switch (command) {
@@ -412,6 +579,12 @@ switch (command) {
   case "doctor":
     runDoctor();
     break;
+  case "export":
+    runExport();
+    break;
+  case "verify":
+    runVerify();
+    break;
   case "help":
   case "--help":
   case "-h":
@@ -423,6 +596,8 @@ switch (command) {
     start       Open the dashboard (default)
     status      Quick terminal summary
     doctor      Health check — verify everything works
+    export      Export data (--format json|csv|ndjson --start YYYY-MM-DD --end YYYY-MM-DD)
+    verify      Audit integrity check — record counts, user coverage, diff capture
     uninstall   Remove hooks from settings.json
     help        Show this message
 `);

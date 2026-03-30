@@ -32,6 +32,8 @@ export default function SettingsPage() {
   const [exporting, setExporting] = useState(false);
   const [exportStart, setExportStart] = useState("");
   const [exportEnd, setExportEnd] = useState("");
+  const [exportProject, setExportProject] = useState("");
+  const [projects, setProjects] = useState<string[]>([]);
 
   const loadSettings = () => {
     fetch("/api/settings")
@@ -45,6 +47,10 @@ export default function SettingsPage() {
 
   useEffect(() => {
     loadSettings();
+    fetch("/api/insights")
+      .then((r) => r.json())
+      .then((d) => setProjects(d.projects || []))
+      .catch(() => {});
   }, []);
 
   const handleSeed = async () => {
@@ -237,6 +243,19 @@ export default function SettingsPage() {
         </h2>
         <div className="mb-4 flex items-end gap-3">
           <div>
+            <label className="block font-mono text-xs text-zinc-500 mb-1">Project</label>
+            <select
+              value={exportProject}
+              onChange={(e) => setExportProject(e.target.value)}
+              className="rounded border border-zinc-700 bg-zinc-900 px-3 py-1.5 font-mono text-sm text-zinc-300 focus:border-violet-500 focus:outline-none"
+            >
+              <option value="">All projects</option>
+              {projects.map((p) => (
+                <option key={p} value={p}>{p}</option>
+              ))}
+            </select>
+          </div>
+          <div>
             <label className="block font-mono text-xs text-zinc-500 mb-1">From</label>
             <input
               type="date"
@@ -270,6 +289,7 @@ export default function SettingsPage() {
                 setExporting(true);
                 try {
                   const params = new URLSearchParams({ format: opt.format, table: opt.table });
+                  if (exportProject) params.set("project", exportProject);
                   if (exportStart) params.set("start", exportStart);
                   if (exportEnd) params.set("end", exportEnd);
                   const r = await fetch(`/api/export?${params}`);
@@ -279,7 +299,8 @@ export default function SettingsPage() {
                   const a = document.createElement("a");
                   const ext = opt.format === "csv" ? "csv" : "json";
                   a.href = url;
-                  a.download = `claude-pulse-${opt.table}-${new Date().toISOString().split("T")[0]}.${ext}`;
+                  const projSlug = exportProject ? `-${exportProject}` : "";
+                  a.download = `claude-pulse-${opt.table}${projSlug}-${new Date().toISOString().split("T")[0]}.${ext}`;
                   a.click();
                   URL.revokeObjectURL(url);
                   setMessage(`Exported ${opt.table} as ${opt.format.toUpperCase()}`);

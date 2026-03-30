@@ -10,12 +10,14 @@ export async function GET(request: Request) {
     const table = searchParams.get("table") || "all";
     const start = searchParams.get("start");
     const end = searchParams.get("end");
+    const project = searchParams.get("project");
 
     const data: Record<string, unknown[]> = {};
 
     if (table === "all" || table === "sessions") {
       let q = "SELECT * FROM sessions WHERE 1=1";
       const params: string[] = [];
+      if (project) { q += " AND project = ?"; params.push(project); }
       if (start) { q += " AND started_at >= ?"; params.push(start); }
       if (end) { q += " AND started_at <= ?"; params.push(end); }
       q += " ORDER BY started_at DESC";
@@ -23,17 +25,21 @@ export async function GET(request: Request) {
     }
 
     if (table === "all" || table === "events") {
-      let q = "SELECT * FROM tool_events WHERE 1=1";
+      let q = "SELECT e.* FROM tool_events e";
+      if (project) q += " JOIN sessions s ON s.id = e.session_id";
+      q += " WHERE 1=1";
       const params: string[] = [];
-      if (start) { q += " AND timestamp >= ?"; params.push(start); }
-      if (end) { q += " AND timestamp <= ?"; params.push(end); }
-      q += " ORDER BY timestamp DESC";
+      if (project) { q += " AND s.project = ?"; params.push(project); }
+      if (start) { q += " AND e.timestamp >= ?"; params.push(start); }
+      if (end) { q += " AND e.timestamp <= ?"; params.push(end); }
+      q += " ORDER BY e.timestamp DESC";
       data.events = db.prepare(q).all(...params);
     }
 
     if (table === "all" || table === "insights") {
       let q = "SELECT * FROM insights WHERE 1=1";
       const params: string[] = [];
+      if (project) { q += " AND project = ?"; params.push(project); }
       if (start) { q += " AND created_at >= ?"; params.push(start); }
       if (end) { q += " AND created_at <= ?"; params.push(end); }
       q += " ORDER BY created_at DESC";

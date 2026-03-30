@@ -11,6 +11,8 @@ interface SessionInfo {
   endedAt: string | null;
   duration: number;
   status: string;
+  user: string | null;
+  hostname: string | null;
 }
 
 interface EventInfo {
@@ -29,6 +31,7 @@ interface EventInfo {
   agentDescription: string | null;
   skillName: string | null;
   skillArgs: string | null;
+  diffContent: string | null;
 }
 
 interface SessionData {
@@ -119,6 +122,37 @@ function formatDateFull(iso: string): string {
   });
 }
 
+function DiffView({ diff }: { diff: string }) {
+  const [expanded, setExpanded] = useState(false);
+  if (!diff) return null;
+  return (
+    <div className="mt-1">
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="font-mono text-[10px] text-zinc-600 hover:text-zinc-400 transition-colors"
+      >
+        {expanded ? "▾ hide diff" : "▸ show diff"}
+      </button>
+      {expanded && (
+        <pre className="mt-1 max-h-48 overflow-auto rounded border border-zinc-800 bg-zinc-950 p-2 font-mono text-[11px] leading-relaxed">
+          {diff.split("\n").map((line, i) => (
+            <div
+              key={i}
+              className={
+                line.startsWith("+++ ") ? "text-green-500 font-semibold" :
+                line.startsWith("--- ") ? "text-red-500 font-semibold" :
+                "text-zinc-400"
+              }
+            >
+              {line}
+            </div>
+          ))}
+        </pre>
+      )}
+    </div>
+  );
+}
+
 function EventDetail({ event }: { event: EventInfo }) {
   const { toolName } = event;
 
@@ -138,6 +172,7 @@ function EventDetail({ event }: { event: EventInfo }) {
             <span className="ml-2 text-zinc-600">{event.language}</span>
           )}
         </span>
+        {event.diffContent && <DiffView diff={event.diffContent} />}
       </div>
     );
   }
@@ -319,6 +354,14 @@ export default function SessionDetailPage({
               {session.status}
             </p>
           </div>
+          {(session.user || session.hostname) && (
+            <div>
+              <p className="text-xs text-zinc-500">Identity</p>
+              <p className="text-zinc-300">
+                {session.user || "?"}@{session.hostname || "?"}
+              </p>
+            </div>
+          )}
         </div>
       </div>
 

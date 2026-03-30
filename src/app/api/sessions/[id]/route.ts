@@ -28,6 +28,7 @@ interface EventRow {
   agent_description: string | null;
   skill_name: string | null;
   skill_args: string | null;
+  diff_content: string | null;
 }
 
 export async function GET(
@@ -40,7 +41,7 @@ export async function GET(
 
     const session = db
       .prepare(
-        `SELECT id, project, started_at, ended_at, duration_seconds, summary, status
+        `SELECT id, project, started_at, ended_at, duration_seconds, summary, status, user, hostname
         FROM sessions WHERE id = ?`
       )
       .get(id) as SessionRow | undefined;
@@ -55,7 +56,7 @@ export async function GET(
           id, tool_name, timestamp, file_path, language,
           lines_added, lines_removed, command, detected_framework,
           command_failed, search_pattern, agent_type, agent_description,
-          skill_name, skill_args
+          skill_name, skill_args, diff_content
         FROM tool_events
         WHERE session_id = ?
         ORDER BY timestamp ASC`
@@ -83,6 +84,8 @@ export async function GET(
         duration: session.duration_seconds ?? 0,
         summary: session.summary,
         status: session.status,
+        user: (session as SessionRow & { user?: string }).user || null,
+        hostname: (session as SessionRow & { hostname?: string }).hostname || null,
       },
       summary: {
         totalEvents: events.length,
@@ -108,6 +111,7 @@ export async function GET(
         agentDescription: e.agent_description,
         skillName: e.skill_name,
         skillArgs: e.skill_args,
+        diffContent: e.diff_content,
       })),
     });
   } catch (err) {

@@ -45,6 +45,21 @@ sudo apt install jq sqlite3
 
 ### Install
 
+#### Option A: Global install (recommended)
+
+```bash
+git clone https://github.com/Clemens865/Claude-Pulse.git
+cd Claude-Pulse
+npm install
+npm run build && node bin/copy-static.mjs
+npm link
+claude-pulse init
+```
+
+Now `claude-pulse` works from any directory. Use Claude Code normally — everything is captured in the background.
+
+#### Option B: Local install (use with npx)
+
 ```bash
 git clone https://github.com/Clemens865/Claude-Pulse.git
 cd Claude-Pulse
@@ -52,12 +67,13 @@ npm install
 npx claude-pulse init
 ```
 
-That's it. Claude Pulse is now active for all projects. Use Claude Code normally — everything is captured in the background.
+With a local install, prefix all commands with `npx` and run them from the project directory.
 
 ### View your dashboard
 
 ```bash
-npx claude-pulse start
+claude-pulse start    # global install
+npx claude-pulse start  # local install
 ```
 
 Open **http://localhost:3141**.
@@ -88,13 +104,15 @@ Database info, record counts, and an export section with project/date filtering.
 
 | Command | What it does |
 |---------|-------------|
-| `npx claude-pulse init` | Set up hooks and database (safe to re-run) |
-| `npx claude-pulse start` | Open the dashboard |
-| `npx claude-pulse status` | Quick terminal summary |
-| `npx claude-pulse doctor` | Health check — verify everything works |
-| `npx claude-pulse export` | Export data as JSON, CSV, or NDJSON |
-| `npx claude-pulse verify` | Audit integrity check |
-| `npx claude-pulse uninstall` | Remove hooks (data preserved) |
+| `claude-pulse init` | Set up hooks and database (safe to re-run) |
+| `claude-pulse start` | Open the dashboard |
+| `claude-pulse status` | Quick terminal summary |
+| `claude-pulse doctor` | Health check — verify everything works |
+| `claude-pulse export` | Export data as JSON, CSV, or NDJSON |
+| `claude-pulse verify` | Audit integrity check |
+| `claude-pulse uninstall` | Remove hooks (data preserved) |
+
+> **Note:** If you installed locally (without `npm link`), prefix all commands with `npx`.
 
 Export supports filtering:
 ```bash
@@ -173,9 +191,9 @@ Next.js dashboard (localhost:3141)
 
 ## Troubleshooting
 
-**No data showing up?** Run `npx claude-pulse doctor` — it checks deps, hooks, DB, and recent activity.
+**No data showing up?** Run `claude-pulse doctor` — it checks deps, hooks, DB, and recent activity.
 
-**jq or sqlite3 not found?** Install them (`brew install jq sqlite3` or `apt install jq sqlite3`), then re-run `npx claude-pulse init`.
+**jq or sqlite3 not found?** Install them (`brew install jq sqlite3` or `apt install jq sqlite3`), then re-run `claude-pulse init`.
 
 **Dashboard won't start?** Check if port 3141 is in use: `lsof -i :3141`.
 
@@ -187,7 +205,7 @@ npx claude-pulse init
 
 **Remove completely:**
 ```bash
-npx claude-pulse uninstall   # removes hooks
+claude-pulse uninstall   # removes hooks
 rm -rf ~/.claude-pulse        # removes data
 ```
 

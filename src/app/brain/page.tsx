@@ -144,7 +144,7 @@ export default function BrainPage() {
 
       {/* Project filter */}
       {data.projects.length > 1 && (
-        <div className="mb-6 flex items-center gap-2">
+        <div className="mb-6 flex flex-wrap items-center gap-2">
           <span className="font-mono text-xs text-zinc-500">Project:</span>
           <button
             onClick={() => setFilterProject(null)}

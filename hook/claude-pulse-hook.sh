@@ -320,33 +320,81 @@ handle_session_start() {
     # Create session tmp dir
     mkdir -p "$SESSION_DIR" 2>/dev/null || true
 
-    # Output context injection — share cross-session context
+    # Output context injection — rich project context load (runs once per session)
     local ctx=""
     local esc_sid
     esc_sid="$(sql_escape "$SESSION_ID")"
 
-    # 1. Last session's Claude-written summary (the most valuable context)
-    local last_summary
-    last_summary="$(sqlite3 "$DB_PATH" "SELECT summary FROM sessions WHERE project='$esc_project' AND status='completed' AND summary IS NOT NULL AND summary != '' ORDER BY ended_at DESC LIMIT 1;" 2>/dev/null)" || true
+    # --- Section 1: Project Identity ---
+    ctx="PROJECT: ${PROJECT}\n"
 
-    if [ -n "$last_summary" ]; then
-        ctx="Last session: ${last_summary}"
-    else
-        # Fallback to basic stats if no summary exists yet
-        local last_session
-        last_session="$(sqlite3 "$DB_PATH" "SELECT s.duration_seconds, (SELECT COUNT(*) FROM tool_events WHERE session_id=s.id) as events FROM sessions s WHERE s.project='$esc_project' AND s.status='completed' ORDER BY s.ended_at DESC LIMIT 1;" 2>/dev/null)" || true
-        if [ -n "$last_session" ]; then
-            local dur events
-            dur="$(echo "$last_session" | cut -d'|' -f1)"
-            events="$(echo "$last_session" | cut -d'|' -f2)"
-            if [ -n "$dur" ] && [ "$dur" != "" ]; then
-                local mins=$(( dur / 60 ))
-                ctx="Last session in $PROJECT: ${mins}min, ${events} tool calls."
-            fi
-        fi
+    # --- Section 2: Recent Session Summaries (last 5) ---
+    local session_history
+    session_history="$(sqlite3 "$DB_PATH" "
+        SELECT datetime(started_at, 'localtime') || ' (' || COALESCE(CAST(duration_seconds/60 AS TEXT) || 'min', '?') || '): ' || COALESCE(summary, '(no summary)')
+        FROM sessions
+        WHERE project='$esc_project' AND status='completed' AND summary IS NOT NULL AND summary != ''
+        ORDER BY ended_at DESC LIMIT 5;
+    " 2>/dev/null)" || true
+
+    if [ -n "$session_history" ]; then
+        ctx="${ctx}\nRECENT SESSIONS:\n${session_history}\n"
     fi
 
-    # 2. Today's stats
+    # --- Section 3: All Insights (progress, decisions, blockers, patterns, fixes) ---
+    # Progress & decisions: last 10
+    local progress_decisions
+    progress_decisions="$(sqlite3 "$DB_PATH" "
+        SELECT '[' || type || '] ' || content
+        FROM insights
+        WHERE project='$esc_project' AND type IN ('progress','decision')
+        ORDER BY created_at DESC LIMIT 10;
+    " 2>/dev/null)" || true
+
+    if [ -n "$progress_decisions" ]; then
+        ctx="${ctx}\nPROGRESS & DECISIONS:\n${progress_decisions}\n"
+    fi
+
+    # Active blockers (not yet resolved — last 5)
+    local blockers
+    blockers="$(sqlite3 "$DB_PATH" "
+        SELECT content FROM insights
+        WHERE project='$esc_project' AND type='blocked'
+        ORDER BY created_at DESC LIMIT 5;
+    " 2>/dev/null)" || true
+
+    if [ -n "$blockers" ]; then
+        ctx="${ctx}\nBLOCKERS:\n${blockers}\n"
+    fi
+
+    # Knowledge: patterns, fixes, context (all — these are explicitly stored)
+    local knowledge
+    knowledge="$(sqlite3 "$DB_PATH" "
+        SELECT '[' || type || '] ' || content
+        FROM insights
+        WHERE project='$esc_project' AND type IN ('pattern','fix','context')
+        ORDER BY created_at DESC LIMIT 10;
+    " 2>/dev/null)" || true
+
+    if [ -n "$knowledge" ]; then
+        ctx="${ctx}\nKNOWLEDGE:\n${knowledge}\n"
+    fi
+
+    # --- Section 4: Most Active Files (by edit frequency, last 14 days) ---
+    local top_files
+    top_files="$(sqlite3 "$DB_PATH" "
+        SELECT REPLACE(file_path, '$(sql_escape "$CWD")/', '') || ' (' || SUM(edit_count) || ' edits, +' || SUM(lines_added) || '/-' || SUM(lines_removed) || ')'
+        FROM file_activity
+        WHERE project='$esc_project' AND date >= date('now', '-14 days')
+        GROUP BY file_path
+        ORDER BY SUM(edit_count) DESC LIMIT 10;
+    " 2>/dev/null)" || true
+
+    if [ -n "$top_files" ]; then
+        ctx="${ctx}\nMOST ACTIVE FILES (14d):\n${top_files}\n"
+    fi
+
+    # --- Section 5: Today's Stats ---
     local today_stats
     today_stats="$(sqlite3 "$DB_PATH" "SELECT COUNT(DISTINCT s.id), COUNT(e.id) FROM sessions s LEFT JOIN tool_events e ON e.session_id=s.id WHERE date(s.started_at)='$TODAY';" 2>/dev/null)" || true
 
@@ -355,26 +403,11 @@ handle_session_start() {
         sess_count="$(echo "$today_stats" | cut -d'|' -f1)"
         evt_count="$(echo "$today_stats" | cut -d'|' -f2)"
         if [ "$sess_count" -gt 0 ] 2>/dev/null; then
-            ctx="${ctx:+$ctx }Today: ${sess_count} sessions, ${evt_count} events."
+            ctx="${ctx}\nTODAY: ${sess_count} sessions, ${evt_count} tool events.\n"
         fi
     fi
 
-    # 3. Recently edited files (last session) — helps resume context
-    local recent_files
-    recent_files="$(sqlite3 "$DB_PATH" "
-        SELECT DISTINCT REPLACE(file_path, '$(sql_escape "$CWD")/', '') FROM tool_events
-        WHERE session_id=(SELECT id FROM sessions WHERE project='$esc_project' AND status='completed' ORDER BY ended_at DESC LIMIT 1)
-        AND tool_name IN ('Edit','Write') AND file_path IS NOT NULL AND file_path != ''
-        ORDER BY timestamp DESC LIMIT 5;
-    " 2>/dev/null)" || true
-
-    if [ -n "$recent_files" ]; then
-        local files_list
-        files_list="$(echo "$recent_files" | tr '\n' ', ' | sed 's/,$//')"
-        ctx="${ctx:+$ctx }Last edited: ${files_list}."
-    fi
-
-    # 4. Recent bash failures — helps avoid repeating mistakes
+    # --- Section 6: Recent Failures (last session) ---
     local recent_failures
     recent_failures="$(sqlite3 "$DB_PATH" "
         SELECT command FROM tool_events
@@ -384,40 +417,12 @@ handle_session_start() {
     " 2>/dev/null)" || true
 
     if [ -n "$recent_failures" ]; then
-        local fail_count
-        fail_count="$(echo "$recent_failures" | wc -l | tr -d ' ')"
-        ctx="${ctx:+$ctx }Last session had ${fail_count} failed command(s)."
+        local fail_list
+        fail_list="$(echo "$recent_failures" | head -3 | sed 's/^/  /')"
+        ctx="${ctx}\nLAST SESSION FAILURES:\n${fail_list}\n"
     fi
 
-    # 5. Accumulated knowledge (patterns, fixes, context) — highest value at session start
-    local knowledge
-    knowledge="$(sqlite3 "$DB_PATH" "
-        SELECT type || ': ' || content FROM insights
-        WHERE project='$esc_project' AND type IN ('pattern','fix','context')
-        ORDER BY created_at DESC LIMIT 3;
-    " 2>/dev/null)" || true
-
-    if [ -n "$knowledge" ]; then
-        local knowledge_text
-        knowledge_text="$(echo "$knowledge" | tr '\n' ' | ' | sed 's/ | $//')"
-        ctx="${ctx:+$ctx }Knowledge: ${knowledge_text}."
-    fi
-
-    # 6. Last session insights (progress, decisions, blockers)
-    local recent_insights
-    recent_insights="$(sqlite3 "$DB_PATH" "
-        SELECT type || ': ' || content FROM insights
-        WHERE project='$esc_project' AND type IN ('progress','decision','blocked')
-        ORDER BY created_at DESC LIMIT 3;
-    " 2>/dev/null)" || true
-
-    if [ -n "$recent_insights" ]; then
-        local insights_text
-        insights_text="$(echo "$recent_insights" | tr '\n' ' | ' | sed 's/ | $//')"
-        ctx="${ctx:+$ctx }Last session: ${insights_text}."
-    fi
-
-    # 6. Cross-project: other active projects today
+    # --- Section 7: Cross-project awareness ---
     local other_projects
     other_projects="$(sqlite3 "$DB_PATH" "
         SELECT DISTINCT project FROM sessions
@@ -429,12 +434,53 @@ handle_session_start() {
     if [ -n "$other_projects" ]; then
         local proj_list
         proj_list="$(echo "$other_projects" | tr '\n' ', ' | sed 's/,$//')"
-        ctx="${ctx:+$ctx }Also active recently: ${proj_list}."
+        ctx="${ctx}\nOTHER ACTIVE PROJECTS: ${proj_list}\n"
     fi
 
     if [ -n "$ctx" ]; then
-        printf '{"hookSpecificOutput":{"additionalContext":"[Claude Pulse] %s Use /pulse-latest, /pulse-projects, or /pulse-insights to query cross-project data."}}' "$(echo "$ctx" | sed 's/"/\\"/g')"
+        # Use jq to safely build JSON with newlines preserved
+        printf '%s' "$ctx" | jq -Rs '{
+            hookSpecificOutput: {
+                additionalContext: ("[Claude Pulse] " + . + "\nUse /pulse-latest, /pulse-projects, or /pulse-insights to query cross-project data.")
+            }
+        }' 2>/dev/null || \
+        printf '{"hookSpecificOutput":{"additionalContext":"[Claude Pulse] PROJECT: %s. Use /pulse-latest, /pulse-projects, or /pulse-insights to query cross-project data."}}' "$(echo "$PROJECT" | sed 's/"/\\"/g')"
     fi
+}
+
+# =============================================================================
+# USER PROMPT HANDLER — lightweight per-prompt project identity beacon
+# =============================================================================
+
+handle_user_prompt() {
+    # Ultra-lean: ~30-40 tokens. Just enough for Claude to catch wrong-terminal usage.
+    # Must be FAST — runs on every user message.
+
+    [ ! -f "$DB_PATH" ] && return
+
+    local esc_project
+    esc_project="$(sql_escape "$PROJECT")"
+
+    # Get current focus: last 3 progress/decision insights (compact, one line each)
+    local focus
+    focus="$(sqlite3 "$DB_PATH" "
+        SELECT content FROM insights
+        WHERE project='$esc_project' AND type IN ('progress','decision')
+        ORDER BY created_at DESC LIMIT 2;
+    " 2>/dev/null)" || true
+
+    local focus_short=""
+    if [ -n "$focus" ]; then
+        # Truncate each line to 60 chars, join with semicolons
+        focus_short="$(echo "$focus" | head -2 | cut -c1-60 | tr '\n' '; ' | sed 's/; $//')"
+    fi
+
+    local beacon="[Pulse] project=${PROJECT}"
+    if [ -n "$focus_short" ]; then
+        beacon="${beacon} | focus: ${focus_short}"
+    fi
+
+    printf '{"hookSpecificOutput":{"additionalContext":"%s"}}' "$(echo "$beacon" | sed 's/"/\\"/g')"
 }
 
 handle_tool_event() {
@@ -819,6 +865,9 @@ handle_session_stop() {
 case "$HOOK_TYPE" in
     SessionStart)
         handle_session_start
+        ;;
+    UserPromptSubmit)
+        handle_user_prompt
         ;;
     PostToolUse)
         handle_tool_event

@@ -129,6 +129,17 @@ function mergeHooks() {
     }]
   });
 
+  // Add UserPromptSubmit hook (lightweight project identity beacon — helps catch wrong-terminal usage)
+  if (!settings.hooks.UserPromptSubmit) settings.hooks.UserPromptSubmit = [];
+  settings.hooks.UserPromptSubmit.push({
+    hooks: [{
+      type: "command",
+      command: pulseHookCommand,
+      timeout: 2,
+      statusMessage: "Claude Pulse: context..."
+    }]
+  });
+
   // Add PostToolUse hook (async — tracking doesn't need to block Claude)
   if (!settings.hooks.PostToolUse) settings.hooks.PostToolUse = [];
   settings.hooks.PostToolUse.push({

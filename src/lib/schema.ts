@@ -5,13 +5,14 @@ import type Database from "better-sqlite3";
  * All tables use TEXT for timestamps (ISO 8601) and JSON strings for structured metadata.
  */
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 const CREATE_TABLES = `
 -- Session lifecycle tracking
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     project TEXT NOT NULL,
+    project_path TEXT,
     started_at TEXT NOT NULL DEFAULT (datetime('now')),
     ended_at TEXT,
     duration_seconds INTEGER,
@@ -19,6 +20,30 @@ CREATE TABLE IF NOT EXISTS sessions (
     status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'completed', 'crashed')),
     user TEXT,
     hostname TEXT
+);
+
+-- Blueprint runs ingested from Lazy-Fetch .lazy/runs/*.json
+CREATE TABLE IF NOT EXISTS blueprint_runs (
+    id TEXT PRIMARY KEY,
+    project TEXT NOT NULL,
+    project_path TEXT NOT NULL,
+    blueprint TEXT NOT NULL,
+    input TEXT,
+    status TEXT NOT NULL CHECK(status IN ('running','completed','failed')),
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    duration_ms INTEGER,
+    step_count INTEGER NOT NULL DEFAULT 0,
+    steps_done INTEGER NOT NULL DEFAULT 0,
+    steps_failed INTEGER NOT NULL DEFAULT 0,
+    worktree_path TEXT,
+    worktree_branch TEXT,
+    base_branch TEXT,
+    step_results TEXT NOT NULL DEFAULT '[]',
+    session_id TEXT,
+    source_file TEXT NOT NULL,
+    source_mtime INTEGER NOT NULL,
+    ingested_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 -- Granular tool events (append-only)
@@ -122,6 +147,12 @@ CREATE INDEX IF NOT EXISTS idx_insights_created ON insights(created_at);
 CREATE INDEX IF NOT EXISTS idx_file_activity_path ON file_activity(file_path);
 CREATE INDEX IF NOT EXISTS idx_file_activity_project ON file_activity(project);
 CREATE INDEX IF NOT EXISTS idx_file_activity_date ON file_activity(date);
+
+-- Blueprint run indexes
+CREATE INDEX IF NOT EXISTS idx_runs_project ON blueprint_runs(project);
+CREATE INDEX IF NOT EXISTS idx_runs_status ON blueprint_runs(status);
+CREATE INDEX IF NOT EXISTS idx_runs_started ON blueprint_runs(started_at);
+CREATE INDEX IF NOT EXISTS idx_runs_blueprint ON blueprint_runs(blueprint);
 `;
 
 /**
@@ -131,6 +162,23 @@ CREATE INDEX IF NOT EXISTS idx_file_activity_date ON file_activity(date);
 export function initDatabase(db: Database.Database): void {
   db.exec(CREATE_TABLES);
   db.exec(CREATE_INDEXES);
+
+  // v3 -> v4: ensure project_path column exists on pre-existing sessions tables.
+  // CREATE TABLE IF NOT EXISTS above won't add the column to an old table — only ALTER does.
+  const sessionCols = db
+    .prepare("PRAGMA table_info(sessions)")
+    .all() as Array<{ name: string }>;
+  if (!sessionCols.some((c) => c.name === "project_path")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN project_path TEXT");
+  }
+
+  // v4 -> v4.1: ensure session_id column exists on pre-existing blueprint_runs tables.
+  const runCols = db
+    .prepare("PRAGMA table_info(blueprint_runs)")
+    .all() as Array<{ name: string }>;
+  if (runCols.length > 0 && !runCols.some((c) => c.name === "session_id")) {
+    db.exec("ALTER TABLE blueprint_runs ADD COLUMN session_id TEXT");
+  }
 
   // Set schema version if not already set
   db.exec(`

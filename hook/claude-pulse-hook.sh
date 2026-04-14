@@ -44,6 +44,17 @@ if [ -n "$SESSION_ID" ]; then
 fi
 
 # --- Project detection ---
+detect_project_path() {
+    local dir="${1:-.}"
+    local repo_root
+    repo_root="$(cd "$dir" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null)" || true
+    if [ -n "$repo_root" ]; then
+        echo "$repo_root"
+    else
+        (cd "$dir" 2>/dev/null && pwd) || echo ""
+    fi
+}
+
 detect_project() {
     local dir="${1:-.}"
     local repo_root
@@ -55,6 +66,7 @@ detect_project() {
     fi
 }
 
+PROJECT_PATH="$(detect_project_path "${CWD:-.}")"
 PROJECT="$(detect_project "${CWD:-.}")" || PROJECT="unknown"
 
 # --- Language detection from file extension ---
@@ -168,6 +180,7 @@ PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     project TEXT NOT NULL,
+    project_path TEXT,
     started_at TEXT NOT NULL DEFAULT (datetime('now')),
     ended_at TEXT,
     duration_seconds INTEGER,
@@ -270,7 +283,36 @@ CREATE INDEX IF NOT EXISTS idx_insights_type ON insights(type);
 CREATE INDEX IF NOT EXISTS idx_insights_session ON insights(session_id);
 CREATE INDEX IF NOT EXISTS idx_insights_created ON insights(created_at);
 
-INSERT OR IGNORE INTO schema_version (version) VALUES (3);
+CREATE TABLE IF NOT EXISTS blueprint_runs (
+    id TEXT PRIMARY KEY,
+    project TEXT NOT NULL,
+    project_path TEXT NOT NULL,
+    blueprint TEXT NOT NULL,
+    input TEXT,
+    status TEXT NOT NULL CHECK(status IN ('running','completed','failed')),
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    duration_ms INTEGER,
+    step_count INTEGER NOT NULL DEFAULT 0,
+    steps_done INTEGER NOT NULL DEFAULT 0,
+    steps_failed INTEGER NOT NULL DEFAULT 0,
+    worktree_path TEXT,
+    worktree_branch TEXT,
+    base_branch TEXT,
+    step_results TEXT NOT NULL DEFAULT '[]',
+    session_id TEXT,
+    source_file TEXT NOT NULL,
+    source_mtime INTEGER NOT NULL,
+    ingested_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_runs_project ON blueprint_runs(project);
+CREATE INDEX IF NOT EXISTS idx_runs_status ON blueprint_runs(status);
+CREATE INDEX IF NOT EXISTS idx_runs_started ON blueprint_runs(started_at);
+CREATE INDEX IF NOT EXISTS idx_runs_blueprint ON blueprint_runs(blueprint);
+CREATE INDEX IF NOT EXISTS idx_runs_session ON blueprint_runs(session_id);
+
+INSERT OR IGNORE INTO schema_version (version) VALUES (4);
 SCHEMA
     else
         # Migrate existing DB: add insights table if missing
@@ -291,6 +333,35 @@ SCHEMA
         sqlite3 "$DB_PATH" "ALTER TABLE sessions ADD COLUMN user TEXT;" 2>/dev/null || true
         sqlite3 "$DB_PATH" "ALTER TABLE sessions ADD COLUMN hostname TEXT;" 2>/dev/null || true
         sqlite3 "$DB_PATH" "ALTER TABLE tool_events ADD COLUMN diff_content TEXT;" 2>/dev/null || true
+        # v4 migration: project_path on sessions + blueprint_runs table
+        sqlite3 "$DB_PATH" "ALTER TABLE sessions ADD COLUMN project_path TEXT;" 2>/dev/null || true
+        sqlite3 "$DB_PATH" "CREATE TABLE IF NOT EXISTS blueprint_runs (
+            id TEXT PRIMARY KEY,
+            project TEXT NOT NULL,
+            project_path TEXT NOT NULL,
+            blueprint TEXT NOT NULL,
+            input TEXT,
+            status TEXT NOT NULL CHECK(status IN ('running','completed','failed')),
+            started_at TEXT NOT NULL,
+            completed_at TEXT,
+            duration_ms INTEGER,
+            step_count INTEGER NOT NULL DEFAULT 0,
+            steps_done INTEGER NOT NULL DEFAULT 0,
+            steps_failed INTEGER NOT NULL DEFAULT 0,
+            worktree_path TEXT,
+            worktree_branch TEXT,
+            base_branch TEXT,
+            step_results TEXT NOT NULL DEFAULT '[]',
+            source_file TEXT NOT NULL,
+            source_mtime INTEGER NOT NULL,
+            ingested_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );" 2>/dev/null || true
+        sqlite3 "$DB_PATH" "CREATE INDEX IF NOT EXISTS idx_runs_project ON blueprint_runs(project);" 2>/dev/null || true
+        sqlite3 "$DB_PATH" "CREATE INDEX IF NOT EXISTS idx_runs_status ON blueprint_runs(status);" 2>/dev/null || true
+        sqlite3 "$DB_PATH" "CREATE INDEX IF NOT EXISTS idx_runs_started ON blueprint_runs(started_at);" 2>/dev/null || true
+        sqlite3 "$DB_PATH" "CREATE INDEX IF NOT EXISTS idx_runs_blueprint ON blueprint_runs(blueprint);" 2>/dev/null || true
+        sqlite3 "$DB_PATH" "ALTER TABLE blueprint_runs ADD COLUMN session_id TEXT;" 2>/dev/null || true
+        sqlite3 "$DB_PATH" "CREATE INDEX IF NOT EXISTS idx_runs_session ON blueprint_runs(session_id);" 2>/dev/null || true
     fi
     # Ensure WAL mode on existing DB
     sqlite3 "$DB_PATH" "PRAGMA journal_mode=WAL;" >/dev/null 2>&1 || true
@@ -313,9 +384,11 @@ handle_session_start() {
     ensure_db
 
     # Create session row
-    local esc_project
+    local esc_project esc_project_path
     esc_project="$(sql_escape "$PROJECT")"
-    sqlite3 "$DB_PATH" "INSERT OR IGNORE INTO sessions (id, project, started_at, status, user, hostname) VALUES ('$(sql_escape "$SESSION_ID")', '$esc_project', '$NOW', 'active', '$(sql_escape "$PULSE_USER")', '$(sql_escape "$PULSE_HOSTNAME")');" 2>/dev/null || true
+    esc_project_path="$(sql_escape "$PROJECT_PATH")"
+    sqlite3 "$DB_PATH" "INSERT OR IGNORE INTO sessions (id, project, project_path, started_at, status, user, hostname) VALUES ('$(sql_escape "$SESSION_ID")', '$esc_project', '$esc_project_path', '$NOW', 'active', '$(sql_escape "$PULSE_USER")', '$(sql_escape "$PULSE_HOSTNAME")');" 2>/dev/null || true
+    sqlite3 "$DB_PATH" "UPDATE sessions SET project_path='$esc_project_path' WHERE id='$(sql_escape "$SESSION_ID")' AND (project_path IS NULL OR project_path='');" 2>/dev/null || true
 
     # Create session tmp dir
     mkdir -p "$SESSION_DIR" 2>/dev/null || true
@@ -487,9 +560,11 @@ handle_tool_event() {
     ensure_db
 
     # Ensure session exists (in case session-start was missed)
-    local esc_project
+    local esc_project esc_project_path
     esc_project="$(sql_escape "$PROJECT")"
-    sqlite3 "$DB_PATH" "INSERT OR IGNORE INTO sessions (id, project, started_at, status, user, hostname) VALUES ('$(sql_escape "$SESSION_ID")', '$esc_project', '$NOW', 'active', '$(sql_escape "$PULSE_USER")', '$(sql_escape "$PULSE_HOSTNAME")');" 2>/dev/null || true
+    esc_project_path="$(sql_escape "$PROJECT_PATH")"
+    sqlite3 "$DB_PATH" "INSERT OR IGNORE INTO sessions (id, project, project_path, started_at, status, user, hostname) VALUES ('$(sql_escape "$SESSION_ID")', '$esc_project', '$esc_project_path', '$NOW', 'active', '$(sql_escape "$PULSE_USER")', '$(sql_escape "$PULSE_HOSTNAME")');" 2>/dev/null || true
+    sqlite3 "$DB_PATH" "UPDATE sessions SET project_path='$esc_project_path' WHERE id='$(sql_escape "$SESSION_ID")' AND (project_path IS NULL OR project_path='');" 2>/dev/null || true
 
     # Parse tool-specific fields
     local file_path="" language="" lines_added=0 lines_removed=0

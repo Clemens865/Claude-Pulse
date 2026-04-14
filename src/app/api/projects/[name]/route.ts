@@ -1,4 +1,5 @@
 import { getDb } from "@/lib/db";
+import { ingestBlueprintRuns } from "@/lib/blueprint-ingest";
 
 export const dynamic = "force-dynamic";
 
@@ -37,6 +38,20 @@ interface SessionRow {
   lines_removed: number;
 }
 
+interface RunRow {
+  id: string;
+  blueprint: string;
+  input: string | null;
+  status: string;
+  started_at: string;
+  duration_ms: number | null;
+  step_count: number;
+  steps_done: number;
+  steps_failed: number;
+  worktree_branch: string | null;
+  session_id: string | null;
+}
+
 export async function GET(
   _request: Request,
   { params }: { params: Promise<{ name: string }> }
@@ -44,6 +59,8 @@ export async function GET(
   try {
     const { name } = await params;
     const project = decodeURIComponent(name);
+    // Ingest before reading so the runs section reflects current Lazy-Fetch state.
+    ingestBlueprintRuns();
     const db = getDb();
 
     // KPIs for this project
@@ -110,6 +127,29 @@ export async function GET(
       )
       .all(project) as FileActivityRow[];
 
+    // Recent 10 blueprint runs
+    const runs = db
+      .prepare(
+        `SELECT id, blueprint, input, status, started_at, duration_ms,
+                step_count, steps_done, steps_failed, worktree_branch, session_id
+           FROM blueprint_runs
+          WHERE project = ?
+          ORDER BY started_at DESC
+          LIMIT 10`
+      )
+      .all(project) as RunRow[];
+
+    const runStats = db
+      .prepare(
+        `SELECT
+           COUNT(*) as total,
+           SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) as completed,
+           SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) as failed
+         FROM blueprint_runs
+         WHERE project = ?`
+      )
+      .get(project) as { total: number; completed: number; failed: number };
+
     // Recent 20 sessions
     const sessions = db
       .prepare(
@@ -173,6 +213,24 @@ export async function GET(
         tools: s.tool_count,
         lines: s.lines_added - s.lines_removed,
       })),
+      recentRuns: runs.map((r) => ({
+        id: r.id,
+        blueprint: r.blueprint,
+        input: r.input,
+        status: r.status,
+        startedAt: r.started_at,
+        durationMs: r.duration_ms,
+        stepCount: r.step_count,
+        stepsDone: r.steps_done,
+        stepsFailed: r.steps_failed,
+        worktreeBranch: r.worktree_branch,
+        sessionId: r.session_id,
+      })),
+      runStats: {
+        total: runStats.total ?? 0,
+        completed: runStats.completed ?? 0,
+        failed: runStats.failed ?? 0,
+      },
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";

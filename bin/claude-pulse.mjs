@@ -10,8 +10,8 @@
  *   uninstall  Remove hooks and optionally data
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync, statSync } from "fs";
-import { join, dirname } from "path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync, statSync, readdirSync } from "fs";
+import { join, dirname, basename } from "path";
 import { homedir } from "os";
 import { execSync } from "child_process";
 import { fileURLToPath } from "url";
@@ -596,6 +596,110 @@ function runVerify() {
   console.log();
 }
 
+// ─── REPATH ───
+// Backfill sessions.project_path for old sessions by searching common roots
+// for git repos whose basename matches each project name.
+
+function runRepath() {
+  console.log("\n  Claude Pulse — Backfill project_path\n");
+
+  if (!existsSync(DB_PATH)) {
+    log("No database. Run: claude-pulse init");
+    return;
+  }
+
+  // Find projects with NULL project_path
+  let projectsNeedingPath;
+  try {
+    projectsNeedingPath = execSync(
+      `sqlite3 "${DB_PATH}" "SELECT DISTINCT project FROM sessions WHERE project_path IS NULL OR project_path='';"`,
+      { encoding: "utf-8" }
+    )
+      .trim()
+      .split("\n")
+      .filter(Boolean);
+  } catch (e) {
+    logWarn(`Failed to query DB: ${e.message}`);
+    return;
+  }
+
+  if (projectsNeedingPath.length === 0) {
+    logOk("All sessions already have a project_path");
+    return;
+  }
+
+  log(`Found ${projectsNeedingPath.length} project(s) without paths`);
+
+  // Common roots to search — order matters, deeper/more specific first
+  const roots = [
+    join(homedir(), "Documents", "Software-Projects"),
+    join(homedir(), "Documents"),
+    join(homedir(), "Projects"),
+    join(homedir(), "code"),
+    join(homedir(), "src"),
+    join(homedir(), "repos"),
+    join(homedir(), "dev"),
+  ].filter((r) => existsSync(r));
+
+  // Build an index: basename -> first matching git repo path
+  const index = new Map();
+  for (const root of roots) {
+    try {
+      // 2-level scan only — fast and sufficient for most layouts
+      for (const entry of readdirSync(root, { withFileTypes: true })) {
+        if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+        const lvl1 = join(root, entry.name);
+        if (existsSync(join(lvl1, ".git")) && !index.has(entry.name)) {
+          index.set(entry.name, lvl1);
+        }
+        // One level deeper
+        try {
+          for (const sub of readdirSync(lvl1, { withFileTypes: true })) {
+            if (!sub.isDirectory() || sub.name.startsWith(".")) continue;
+            const lvl2 = join(lvl1, sub.name);
+            if (existsSync(join(lvl2, ".git")) && !index.has(sub.name)) {
+              index.set(sub.name, lvl2);
+            }
+          }
+        } catch {}
+      }
+    } catch {}
+  }
+
+  log(`Indexed ${index.size} git repos across ${roots.length} root(s)`);
+
+  let updated = 0;
+  let unmatched = [];
+  for (const project of projectsNeedingPath) {
+    const path = index.get(project);
+    if (!path) {
+      unmatched.push(project);
+      continue;
+    }
+    const escProject = project.replace(/'/g, "''");
+    const escPath = path.replace(/'/g, "''");
+    try {
+      const result = execSync(
+        `sqlite3 "${DB_PATH}" "UPDATE sessions SET project_path='${escPath}' WHERE project='${escProject}' AND (project_path IS NULL OR project_path=''); SELECT changes();"`,
+        { encoding: "utf-8" }
+      ).trim();
+      const n = parseInt(result, 10) || 0;
+      updated += n;
+      logOk(`${project} → ${path} (${n} sessions)`);
+    } catch (e) {
+      logWarn(`${project}: ${e.message}`);
+    }
+  }
+
+  console.log();
+  log(`Backfilled ${updated} sessions across ${projectsNeedingPath.length - unmatched.length} project(s)`);
+  if (unmatched.length > 0) {
+    logWarn(`Unmatched (no git repo found): ${unmatched.join(", ")}`);
+    log("These projects either no longer exist on disk or live outside the searched roots.");
+  }
+  console.log();
+}
+
 // ─── ROUTE ───
 
 switch (command) {
@@ -620,6 +724,9 @@ switch (command) {
   case "verify":
     runVerify();
     break;
+  case "repath":
+    runRepath();
+    break;
   case "help":
   case "--help":
   case "-h":
@@ -633,6 +740,7 @@ switch (command) {
     doctor      Health check — verify everything works
     export      Export data (--format json|csv|ndjson --start YYYY-MM-DD --end YYYY-MM-DD)
     verify      Audit integrity check — record counts, user coverage, diff capture
+    repath      Backfill project_path on old sessions by scanning common code roots
     uninstall   Remove hooks from settings.json
     help        Show this message
 `);

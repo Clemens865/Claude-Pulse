@@ -18,6 +18,24 @@ interface BrainData {
   projects: string[];
 }
 
+interface BlueprintRun {
+  id: string;
+  project: string;
+  blueprint: string;
+  input: string | null;
+  status: "running" | "completed" | "failed";
+  startedAt: string;
+  durationMs: number | null;
+  stepCount: number;
+  stepsDone: number;
+  stepsFailed: number;
+  sessionId: string | null;
+}
+
+type TimelineItem =
+  | { kind: "insight"; date: string; insight: Insight }
+  | { kind: "run"; date: string; run: BlueprintRun };
+
 const TYPE_COLORS: Record<string, string> = {
   progress: "bg-emerald-500/20 text-emerald-400 border-emerald-500/30",
   decision: "bg-violet-500/20 text-violet-400 border-violet-500/30",
@@ -60,9 +78,11 @@ function formatFullDate(iso: string): string {
 
 export default function BrainPage() {
   const [data, setData] = useState<BrainData | null>(null);
+  const [runs, setRuns] = useState<BlueprintRun[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [filterType, setFilterType] = useState<string | null>(null);
   const [filterProject, setFilterProject] = useState<string | null>(null);
+  const [showRuns, setShowRuns] = useState<boolean>(false);
 
   useEffect(() => {
     const params = new URLSearchParams();
@@ -75,6 +95,20 @@ export default function BrainPage() {
       .then(setData)
       .catch((e) => setError(e.message));
   }, [filterType, filterProject]);
+
+  useEffect(() => {
+    if (!showRuns) {
+      setRuns([]);
+      return;
+    }
+    const params = new URLSearchParams();
+    if (filterProject) params.set("project", filterProject);
+    params.set("limit", "100");
+    fetch(`/api/blueprint-runs?${params}`)
+      .then((r) => r.json())
+      .then((d) => setRuns(d.runs ?? []))
+      .catch(() => setRuns([]));
+  }, [showRuns, filterProject]);
 
   if (error) {
     return (
@@ -93,13 +127,35 @@ export default function BrainPage() {
     0
   );
 
-  // Group insights by date
-  const grouped: Record<string, Insight[]> = {};
-  for (const insight of data.insights) {
-    const date = insight.createdAt.split("T")[0];
-    if (!grouped[date]) grouped[date] = [];
-    grouped[date].push(insight);
+  // Build unified, date-grouped timeline of insights + (optionally) runs
+  const items: TimelineItem[] = [
+    ...data.insights.map<TimelineItem>((i) => ({
+      kind: "insight",
+      date: i.createdAt,
+      insight: i,
+    })),
+    ...(showRuns
+      ? runs.map<TimelineItem>((r) => ({
+          kind: "run",
+          date: r.startedAt,
+          run: r,
+        }))
+      : []),
+  ].sort((a, b) => (a.date < b.date ? 1 : -1));
+
+  const grouped: Record<string, TimelineItem[]> = {};
+  for (const item of items) {
+    const day = item.date.split("T")[0];
+    if (!grouped[day]) grouped[day] = [];
+    grouped[day].push(item);
   }
+
+  const formatRunDuration = (ms: number | null) => {
+    if (ms === null) return "—";
+    if (ms < 1000) return `${ms}ms`;
+    if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+    return `${Math.floor(ms / 60_000)}m`;
+  };
 
   return (
     <div>
@@ -140,6 +196,25 @@ export default function BrainPage() {
             <div className="text-xs text-zinc-500 capitalize">{item.label}</div>
           </button>
         ))}
+      </div>
+
+      {/* Show runs toggle */}
+      <div className="mb-6 flex items-center gap-2">
+        <button
+          onClick={() => setShowRuns((v) => !v)}
+          className={`rounded border px-2 py-1 font-mono text-xs transition-colors ${
+            showRuns
+              ? "border-violet-500 bg-violet-500/10 text-violet-300"
+              : "border-zinc-800 bg-zinc-900/50 text-zinc-500 hover:border-zinc-700"
+          }`}
+        >
+          {showRuns ? "▶ runs visible" : "▶ show blueprint runs"}
+        </button>
+        {showRuns && runs.length > 0 && (
+          <span className="font-mono text-[10px] text-zinc-600">
+            {runs.length} runs interleaved
+          </span>
+        )}
       </div>
 
       {/* Project filter */}
@@ -191,7 +266,7 @@ export default function BrainPage() {
 
       {/* Timeline */}
       <div className="space-y-6">
-        {Object.entries(grouped).map(([date, insights]) => (
+        {Object.entries(grouped).map(([date, dayItems]) => (
           <div key={date}>
             {/* Date header */}
             <div className="mb-3 flex items-center gap-3">
@@ -204,52 +279,86 @@ export default function BrainPage() {
               </div>
               <div className="h-px flex-1 bg-zinc-800" />
               <div className="font-mono text-xs text-zinc-600">
-                {insights.length} entries
+                {dayItems.length} entries
               </div>
             </div>
 
-            {/* Insight entries */}
+            {/* Entries */}
             <div className="space-y-2 pl-4 border-l border-zinc-800">
-              {insights.map((insight) => (
-                <div
-                  key={insight.id}
-                  className="group flex items-start gap-3 rounded-md px-3 py-2 transition-colors hover:bg-zinc-900/50"
-                >
-                  {/* Type badge */}
-                  <span
-                    className={`mt-0.5 inline-flex items-center rounded border px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider ${
-                      TYPE_COLORS[insight.type] || TYPE_COLORS.context
-                    }`}
+              {dayItems.map((item) =>
+                item.kind === "insight" ? (
+                  <div
+                    key={`i-${item.insight.id}`}
+                    className="group flex items-start gap-3 rounded-md px-3 py-2 transition-colors hover:bg-zinc-900/50"
                   >
-                    {TYPE_ICONS[insight.type] || "○"} {insight.type}
-                  </span>
-
-                  {/* Content */}
-                  <div className="flex-1 min-w-0">
-                    <p className="font-mono text-sm text-zinc-200 leading-relaxed">
-                      {insight.content}
-                    </p>
-                    {insight.reasoning && (
-                      <p className="mt-1 font-mono text-xs text-zinc-500 italic">
-                        {insight.reasoning}
-                      </p>
-                    )}
-                  </div>
-
-                  {/* Meta */}
-                  <div className="flex shrink-0 flex-col items-end gap-1">
-                    <span className="font-mono text-[10px] text-zinc-600">
-                      {formatDate(insight.createdAt)}
-                    </span>
                     <span
-                      className="font-mono text-[10px] text-zinc-700 opacity-0 group-hover:opacity-100 transition-opacity"
-                      title={formatFullDate(insight.createdAt)}
+                      className={`mt-0.5 inline-flex items-center rounded border px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider ${
+                        TYPE_COLORS[item.insight.type] || TYPE_COLORS.context
+                      }`}
                     >
-                      {insight.project}
+                      {TYPE_ICONS[item.insight.type] || "○"} {item.insight.type}
                     </span>
+                    <div className="flex-1 min-w-0">
+                      <p className="font-mono text-sm text-zinc-200 leading-relaxed">
+                        {item.insight.content}
+                      </p>
+                      {item.insight.reasoning && (
+                        <p className="mt-1 font-mono text-xs text-zinc-500 italic">
+                          {item.insight.reasoning}
+                        </p>
+                      )}
+                    </div>
+                    <div className="flex shrink-0 flex-col items-end gap-1">
+                      <span className="font-mono text-[10px] text-zinc-600">
+                        {formatDate(item.insight.createdAt)}
+                      </span>
+                      <span
+                        className="font-mono text-[10px] text-zinc-700 opacity-0 group-hover:opacity-100 transition-opacity"
+                        title={formatFullDate(item.insight.createdAt)}
+                      >
+                        {item.insight.project}
+                      </span>
+                    </div>
                   </div>
-                </div>
-              ))}
+                ) : (
+                  <div
+                    key={`r-${item.run.id}`}
+                    className="group flex items-start gap-3 rounded-md border border-zinc-800/30 bg-zinc-900/20 px-3 py-2 transition-colors hover:bg-zinc-900/50"
+                  >
+                    <span
+                      className={`mt-0.5 inline-flex items-center rounded border px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider ${
+                        item.run.status === "completed"
+                          ? "border-emerald-500/30 bg-emerald-500/20 text-emerald-400"
+                          : item.run.status === "failed"
+                            ? "border-rose-500/30 bg-rose-500/20 text-rose-400"
+                            : "border-sky-500/30 bg-sky-500/20 text-sky-400"
+                      }`}
+                    >
+                      ▶ run
+                    </span>
+                    <div className="flex-1 min-w-0">
+                      <p className="font-mono text-sm text-zinc-200 leading-relaxed">
+                        <span className="font-semibold">{item.run.blueprint}</span>
+                        {item.run.input && (
+                          <span className="text-zinc-500"> · {item.run.input}</span>
+                        )}
+                      </p>
+                      <p className="mt-1 font-mono text-[10px] text-zinc-500">
+                        {item.run.status} · {item.run.stepsDone}/{item.run.stepCount} steps · {formatRunDuration(item.run.durationMs)}
+                        {item.run.stepsFailed > 0 && ` · ${item.run.stepsFailed} failed`}
+                      </p>
+                    </div>
+                    <div className="flex shrink-0 flex-col items-end gap-1">
+                      <span className="font-mono text-[10px] text-zinc-600">
+                        {formatDate(item.run.startedAt)}
+                      </span>
+                      <span className="font-mono text-[10px] text-zinc-700 opacity-0 group-hover:opacity-100 transition-opacity">
+                        {item.run.project}
+                      </span>
+                    </div>
+                  </div>
+                )
+              )}
             </div>
           </div>
         ))}

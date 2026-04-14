@@ -45,6 +45,20 @@ interface ProjectData {
     tools: number;
     lines: number;
   }>;
+  recentRuns?: Array<{
+    id: string;
+    blueprint: string;
+    input: string | null;
+    status: "running" | "completed" | "failed";
+    startedAt: string;
+    durationMs: number | null;
+    stepCount: number;
+    stepsDone: number;
+    stepsFailed: number;
+    worktreeBranch: string | null;
+    sessionId: string | null;
+  }>;
+  runStats?: { total: number; completed: number; failed: number };
 }
 
 function KpiCard({
@@ -145,6 +159,17 @@ export default function ProjectDetailPage({
   }
 
   const { kpis, dailyActivity, topFiles, recentSessions } = data;
+  const recentRuns = data.recentRuns ?? [];
+  const runStats = data.runStats ?? { total: 0, completed: 0, failed: 0 };
+
+  const formatRunDuration = (ms: number | null) => {
+    if (ms === null) return "—";
+    if (ms < 1000) return `${ms}ms`;
+    if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+    const m = Math.floor(ms / 60_000);
+    const s = Math.floor((ms % 60_000) / 1000);
+    return `${m}m ${s}s`;
+  };
 
   return (
     <div className="space-y-8">
@@ -290,6 +315,95 @@ export default function ProjectDetailPage({
           </table>
         </div>
       </div>
+
+      {/* Blueprint Runs — Lazy-Fetch executions */}
+      {runStats.total > 0 && (
+        <div className="rounded-lg border border-zinc-800 p-5">
+          <div className="mb-4 flex items-center justify-between">
+            <h2 className="font-mono text-xs uppercase tracking-wider text-zinc-500">
+              Blueprint Runs ({runStats.total})
+            </h2>
+            <div className="flex items-center gap-3 font-mono text-xs">
+              <span className="text-emerald-400/80">
+                ✓ {runStats.completed}
+              </span>
+              {runStats.failed > 0 && (
+                <span className="text-rose-400/80">✗ {runStats.failed}</span>
+              )}
+              <Link
+                href="/runs"
+                className="text-violet-400 hover:underline"
+              >
+                view all →
+              </Link>
+            </div>
+          </div>
+          <div className="space-y-2">
+            {recentRuns.map((r) => (
+              <div
+                key={r.id}
+                className="flex items-start gap-3 rounded border border-zinc-800/50 px-3 py-2 transition-colors hover:border-zinc-700"
+              >
+                <span
+                  className={`mt-0.5 inline-flex items-center rounded border px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider ${
+                    r.status === "completed"
+                      ? "border-emerald-500/30 bg-emerald-500/20 text-emerald-400"
+                      : r.status === "failed"
+                        ? "border-rose-500/30 bg-rose-500/20 text-rose-400"
+                        : "border-sky-500/30 bg-sky-500/20 text-sky-400"
+                  }`}
+                >
+                  {r.status === "completed" && "✓"}
+                  {r.status === "failed" && "✗"}
+                  {r.status === "running" && "◐"} {r.status}
+                </span>
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-baseline gap-2">
+                    <span className="font-mono text-sm font-semibold text-zinc-200">
+                      {r.blueprint}
+                    </span>
+                    {r.input && (
+                      <span className="font-mono text-xs text-zinc-500 truncate">
+                        {r.input}
+                      </span>
+                    )}
+                  </div>
+                  <div className="mt-0.5 flex flex-wrap items-center gap-x-3 font-mono text-[10px] text-zinc-500">
+                    <span>
+                      {r.stepsDone}/{r.stepCount} steps
+                      {r.stepsFailed > 0 && ` · ${r.stepsFailed} failed`}
+                    </span>
+                    <span>·</span>
+                    <span>{formatRunDuration(r.durationMs)}</span>
+                    {r.worktreeBranch && (
+                      <>
+                        <span>·</span>
+                        <span className="text-zinc-600">
+                          ⎇ {r.worktreeBranch.replace(/^lazy\/bp-/, "")}
+                        </span>
+                      </>
+                    )}
+                    {r.sessionId && (
+                      <>
+                        <span>·</span>
+                        <Link
+                          href={`/sessions/${encodeURIComponent(r.sessionId)}`}
+                          className="text-violet-400 hover:underline"
+                        >
+                          session
+                        </Link>
+                      </>
+                    )}
+                  </div>
+                </div>
+                <span className="font-mono text-[10px] text-zinc-600">
+                  {formatDate(r.startedAt)}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Session Log — summaries written by Claude */}
       <div className="rounded-lg border border-zinc-800 p-5">
